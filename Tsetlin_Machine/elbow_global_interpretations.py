@@ -216,26 +216,70 @@ def global_transform(tm: MultiClassConvolutionalTsetlinMachine2D) -> np.ndarray:
 
 # Plotting
 
-def plot_transformed(transformed: np.ndarray, class_names: list[str]) -> plt.Figure:
+def plot_transformed(transformed: np.ndarray, class_names: list[str], X_example: np.ndarray = None) -> plt.Figure:
     """
-    Produce a side-by-side plot of the global interpretation for each class.
+    Produce a multi-row plot of the global interpretation for each class.
+    
+    If X_example is provided:
+        Row 0: Example image from each class
+        Row 1: Global interpretation heatmap
+        Row 2: Overlay of heatmap on example image
+    
+    Otherwise:
+        Row 0: Global interpretation heatmap only
 
     For grayscale output the difference map (positive - negative contributions)
     is rendered with a custom red-white-blue diverging colourmap: dark red = negative evidence,
     white = neutral, dark blue = positive evidence.
+    
+    Parameters
+    ----------
+    transformed  : (num_classes, 2, H, W, 1) global interpretation maps
+    class_names  : list of class label names
+    X_example    : (num_classes, H, W) or (num_classes, H, W, 1) example images per class, or None
     """
     num_classes = transformed.shape[0]
     color_channels = transformed.shape[-1]   # 1 for grayscale
+    has_examples = X_example is not None
 
+    # Determine layout
+    num_rows = 3 if has_examples else 1
+    
     fig, axes = plt.subplots(
-        1, num_classes + 1,
-        figsize=(4 * num_classes + 1, 4.5),
+        num_rows, num_classes + 1,
+        figsize=(4 * num_classes + 1, 4.5 * num_rows),
         gridspec_kw={"width_ratios": [1] * num_classes + [0.06]},
     )
 
+    # Handle case where there's only 1 row (ensure axes is 2D)
+    if num_rows == 1:
+        axes = axes.reshape(1, -1)
+
     im_ref = None
+    vmax_global = None
+
     for c in range(num_classes):
-        ax = axes[c]
+        # Row 0: Example image (if provided)
+        if has_examples:
+            ax = axes[0, c]
+            ax.axis("off")
+            
+            # Handle both (H, W) and (H, W, 1) shapes
+            if X_example.ndim == 3:
+                example_img = X_example[c]
+            else:
+                example_img = X_example[c, ..., 0]
+            
+            # Normalize for display
+            ex_min, ex_max = example_img.min(), example_img.max()
+            example_img_norm = (example_img - ex_min) / (ex_max - ex_min + 1e-7)
+            
+            ax.imshow(example_img_norm, cmap="gray", vmin=0, vmax=1)
+            ax.set_title(f"{class_names[c]} (Example)", fontsize=11, fontweight="bold")
+
+        # Row 1 (or Row 0 if no examples): Global interpretation heatmap
+        row_idx = 1 if has_examples else 0
+        ax = axes[row_idx, c]
         ax.axis("off")
 
         # difference: positive evidence minus negative evidence
@@ -247,6 +291,10 @@ def plot_transformed(transformed: np.ndarray, class_names: list[str]) -> plt.Fig
 
             # Find symmetric limits for better diverging colormap
             vmax = max(abs(img_2d.min()), abs(img_2d.max()))
+            
+            # Store vmax for colorbar (use first class as reference)
+            if vmax_global is None:
+                vmax_global = vmax
 
             # Use TwoSlopeNorm to center white at 0
             norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
@@ -258,28 +306,55 @@ def plot_transformed(transformed: np.ndarray, class_names: list[str]) -> plt.Fig
             for ch in range(color_channels):
                 t = img[..., ch]
                 vmax = max(abs(t.min()), abs(t.max()))
+                if vmax_global is None:
+                    vmax_global = vmax
                 norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
                 im = ax.imshow(t, cmap=custom_cmap, norm=norm)
                 if im_ref is None:
                     im_ref = im
 
-        ax.set_title(class_names[c], fontsize=13, fontweight="bold")
+        ax.set_title(f"{class_names[c]} (Global Map)", fontsize=11, fontweight="bold")
+
+        # Row 2: Overlay (if examples provided)
+        if has_examples:
+            ax = axes[2, c]
+            ax.axis("off")
+            
+            # Display example image
+            if X_example.ndim == 3:
+                example_img = X_example[c]
+            else:
+                example_img = X_example[c, ..., 0]
+            
+            ex_min, ex_max = example_img.min(), example_img.max()
+            example_img_norm = (example_img - ex_min) / (ex_max - ex_min + 1e-7)
+            
+            ax.imshow(example_img_norm, cmap="gray", vmin=0, vmax=1)
+            
+            # Overlay the heatmap with transparency
+            if color_channels == 1:
+                img_2d = img[..., 0]
+                vmax = max(abs(img_2d.min()), abs(img_2d.max()))
+                norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+                ax.imshow(img_2d, cmap=custom_cmap, norm=norm, alpha=0.6)
+            
+            ax.set_title(f"{class_names[c]} (Overlay)", fontsize=11, fontweight="bold")
 
     # Colourbar
-    cax = axes[-1]
-    cax.axis("on")
-    if im_ref is not None:
-        cbar = fig.colorbar(im_ref, cax=cax, fraction=1, pad=0)
-        cbar.set_ticks([-vmax, 0, vmax])
-        cbar.set_ticklabels(["Negative", "Neutral", "Positive"])
-        cbar.ax.tick_params(labelsize=9)
-        cbar.ax.yaxis.set_label_position("right")
-        # Adjust label spacing and alignment
-        for label in cbar.ax.get_yticklabels():
-            label.set_rotation(0)
-            label.set_ha("left")
-    else:
-        cax.axis("off")
+    cax = axes[0, -1] if num_rows > 0 else None
+    if cax is not None:
+        cax.axis("on")
+        if im_ref is not None and vmax_global is not None:
+            cbar = fig.colorbar(im_ref, cax=cax, fraction=1, pad=0)
+            cbar.set_ticks([-vmax_global, 0, vmax_global])
+            cbar.set_ticklabels(["Negative", "Neutral", "Positive"])
+            cbar.ax.tick_params(labelsize=9)
+            cbar.ax.yaxis.set_label_position("right")
+            for label in cbar.ax.get_yticklabels():
+                label.set_rotation(0)
+                label.set_ha("left")
+        else:
+            cax.axis("off")
 
     fig.suptitle("Global Tsetlin Machine Interpretation\nCanine Elbow Dysplasia", fontsize=12)
     fig.tight_layout()
@@ -288,7 +363,7 @@ def plot_transformed(transformed: np.ndarray, class_names: list[str]) -> plt.Fig
 
 # Use
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Global TM interpretations for canine elbow dysplasia")
     parser.add_argument("--exp_name",    type=str, default=None,
                         help="Experiment name used in tsetlin_optuna_on_one_fold.py")
@@ -298,8 +373,12 @@ def main():
                         help="Direct path to best_configs.json (overrides --exp_name default)")
     parser.add_argument("--out_path",    type=str, default=None,
                         help="Where to save the figure (PDF/PNG).  Default: <exp_dir>/global_inter.pdf")
-    parser.add_argument("--base_dir",    type=str, default="D:/CubiAI_tsetlin/perf",
-                        help="Base directory for experiments (default: D:/CubiAI_tsetlin/perf)")
+    parser.add_argument("--base_dir",    type=str, default="set your/base/dir/here",
+                        help="Base directory for experiments (default: default base dir)")
+    parser.add_argument("--dataset_path", type=str, default=None,
+                        help="Path to HDF5 dataset for loading example images")
+    parser.add_argument("--fold",        type=int, default=4,
+                        help="Which fold to sample example images from (default: 4)")
     args = parser.parse_args()
 
     # Resolve paths 
@@ -330,10 +409,50 @@ def main():
     print("\nComputing global transform (this may take a few minutes for large clause counts)...")
     transformed = global_transform(tm)
 
+    # Load example images (optional)
+    X_example = None
+    if args.dataset_path:
+        print(f"Loading example images from {args.dataset_path}...")
+        try:
+            import h5py
+            with h5py.File(args.dataset_path, "r") as f:
+                X_all = f[f"fold_{args.fold}"]["image"][:]
+                Y_all = f[f"fold_{args.fold}"]["target"][:]
+            
+            # Select one example per class
+            X_example = np.zeros((tm.number_of_outputs, *X_all.shape[1:]))
+            for cls in range(tm.number_of_outputs):
+                idx = np.where(Y_all == cls)[0][0]
+                X_example[cls] = X_all[idx]
+        except Exception as e:
+            print(f"Warning: Could not load example images: {e}")
+            X_example = None
+    else:
+        with open(configs_path) as f:
+            cfg = json.load(f)
+        dataset_path = cfg.get("dataset_path")
+        if dataset_path:
+            print(f"Loading example images from {dataset_path}...")
+            try:
+                import h5py
+                with h5py.File(dataset_path, "r") as f:
+                    X_all = f[f"fold_{args.fold}"]["image"][:]
+                    Y_all = f[f"fold_{args.fold}"]["target"][:]
+                
+                X_example = np.zeros((tm.number_of_outputs, *X_all.shape[1:]))
+                for cls in range(tm.number_of_outputs):
+                    idx = np.where(Y_all == cls)[0][0]
+                    X_example[cls] = X_all[idx]
+            except Exception as e:
+                print(f"Warning: Could not load example images: {e}")
+                X_example = None
+
     print("Plotting...")
-    fig = plot_transformed(transformed, CLASS_NAMES)
+    fig = plot_transformed(transformed, CLASS_NAMES, X_example)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"\nFigure saved to: {out_path}")
     plt.show()
+
+

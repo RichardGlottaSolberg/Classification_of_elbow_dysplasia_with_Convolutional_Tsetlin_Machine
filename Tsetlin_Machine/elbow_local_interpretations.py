@@ -170,13 +170,58 @@ def transform_Xs(tm: MultiClassConvolutionalTsetlinMachine2D, Xs_bin_flat: np.nd
 
 # Plotting
 
-def plot_local(X_raw: np.ndarray, X_bin: np.ndarray, Y_true: np.ndarray, Y_pred: np.ndarray, transformed: np.ndarray, n_bits: int,) -> plt.Figure:
+def get_clause_voting(tm: MultiClassConvolutionalTsetlinMachine2D, Xs_bin_flat: np.ndarray) -> np.ndarray:
     """
-    Two-row figure:
+    Calculate prediction certainty based on clause voting.
+    
+    Parameters
+    ----------
+    tm           : trained TM
+    Xs_bin_flat  : (N, H*W*n_bits) binarized & flattened images
+    
+    Returns
+    -------
+    certainty    : (N,) float array with certainty scores in [0, 1]
+    """
+    num_samples = Xs_bin_flat.shape[0]
+    num_patch_x = tm.dim[0] - tm.patch_dim[0] + 1
+    num_patch_y = tm.dim[1] - tm.patch_dim[1] + 1
+    weights = tm.get_weights()  # shape: (n_outputs, n_clauses)
+    
+    # Get clause activations for each sample and reshape properly
+    co_patchwise_flat = tm.transform_patchwise(Xs_bin_flat).toarray()
+    co_patchwise = co_patchwise_flat.reshape(num_samples, tm.number_of_clauses, num_patch_x, num_patch_y)
+    
+    certainty = np.zeros(num_samples)
+    
+    for i in range(num_samples):
+        pred_class = int(tm.predict(Xs_bin_flat[i:i+1])[0])
+        
+        # Get clause activations for this sample (flatten across spatial dims)
+        clause_activations = (co_patchwise[i] > 0).sum(axis=(1, 2))  # (n_clauses,)
+        
+        # Get weights for predicted class
+        class_weights = weights[pred_class]  # (n_clauses,)
+        
+        # Count clauses voting for prediction (active AND positive weight)
+        positive_votes = np.sum((clause_activations > 0) & (class_weights > 0))
+        total_clauses = tm.number_of_clauses
+        
+        # Certainty as proportion of clauses voting for prediction
+        certainty[i] = positive_votes / total_clauses
+    
+    return certainty
+
+
+def plot_local(X_raw: np.ndarray, X_bin: np.ndarray, Y_true: np.ndarray, Y_pred: np.ndarray, transformed: np.ndarray, n_bits: int, certainty: np.ndarray = None) -> plt.Figure:
+    """
+    Three-row figure:
       Row (a) is original X-ray (reconstructed from binarized for consistency)
       Row (b) is clause activation map overlaid as custom red-white-blue heatmap
+      Row (c) is clause activation map overlaid on the original X-ray
 
     Titles show true label and predicted label; a red border flags mispredictions.
+    Certainty percentage is displayed in the title.
 
     Parameters
     ----------
@@ -186,12 +231,13 @@ def plot_local(X_raw: np.ndarray, X_bin: np.ndarray, Y_true: np.ndarray, Y_pred:
     Y_pred      : (N,)  model predictions
     transformed : (N, 2, H, W)  output of transform_Xs
     n_bits      : binarization depth, used to scale unbinarize output
+    certainty   : (N,)  model certainty scores in [0, 1]
     """
     num_samples = X_raw.shape[0]
 
     fig, axs = plt.subplots(
-        2, num_samples,
-        figsize=(2.8 * num_samples, 6),
+        3, num_samples,
+        figsize=(2.8 * num_samples, 9),
         squeeze=False,
         layout="compressed",
     )
@@ -202,23 +248,27 @@ def plot_local(X_raw: np.ndarray, X_bin: np.ndarray, Y_true: np.ndarray, Y_pred:
     for i in range(num_samples):
         ax_img = axs[0, i]
         ax_map = axs[1, i]
+        ax_overlay = axs[2, i]
 
         # Row (a): original X-ray
-        # Display the raw image (squeeze channel dim for grayscale)
         display_img = X_raw[i, ..., 0] if X_raw.shape[-1] == 1 else X_raw[i]
-        # Normalise to [0,1] for display
         dmin, dmax = display_img.min(), display_img.max()
         display_img = (display_img - dmin) / (dmax - dmin + 1e-7)
         ax_img.imshow(display_img, cmap="gray", vmin=0, vmax=1)
 
-        # Title: true / predicted labels; red border on misprediction
-        # Convert predictions to int for indexing
+        # Title with certainty percentage
         true_label = int(Y_true[i])
         pred_label = int(Y_pred[i])
         correct = true_label == pred_label
         title_color = "black" if correct else "red"
+        
+        certainty_str = ""
+        if certainty is not None:
+            certainty_pct = certainty[i] * 100
+            certainty_str = f"\nCertainty: {certainty_pct:.1f}%"
+        
         ax_img.set_title(
-            f"True: {CLASS_NAMES[true_label]}\nPred: {CLASS_NAMES[pred_label]}",
+            f"True: {CLASS_NAMES[true_label]}\nPred: {CLASS_NAMES[pred_label]}{certainty_str}",
             fontsize=8,
             color=title_color,
         )
@@ -230,16 +280,18 @@ def plot_local(X_raw: np.ndarray, X_bin: np.ndarray, Y_true: np.ndarray, Y_pred:
 
         # Row (b): clause activation map
         diff = transformed[i, 0] - transformed[i, 1]
-
-        # Find symmetric limits for better diverging colormap
         vmax = max(abs(diff.min()), abs(diff.max()))
-        
-        # Use TwoSlopeNorm to center white at 0
         norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
         im = ax_map.imshow(diff, cmap=custom_cmap, norm=norm)
 
+        # Row (c): overlay focus areas on original image
+        ax_overlay.imshow(display_img, cmap="gray", vmin=0, vmax=1)
+        
+        # Create alpha-blended overlay of the activation map
+        im_overlay = ax_overlay.imshow(diff, cmap=custom_cmap, norm=norm, alpha=0.6)
+
     # Row labels
-    for row_idx, label in enumerate(["(a) Input X-ray", "(b) TM clause map"]):
+    for row_idx, label in enumerate(["(a) Input X-ray", "(b) TM clause map", "(c) Overlay on X-ray"]):
         axs[row_idx, 0].annotate(
             label,
             xy=(0, 0.5),
@@ -253,12 +305,11 @@ def plot_local(X_raw: np.ndarray, X_bin: np.ndarray, Y_true: np.ndarray, Y_pred:
         )
 
     # Shared colourbar
-    cbar = fig.colorbar(im, ax=axs[1, :], fraction=0.015, pad=0.01, aspect=30)
+    cbar = fig.colorbar(im, ax=axs[1:, :], fraction=0.015, pad=0.01, aspect=30)
     cbar.set_ticks([-vmax, 0, vmax])
     cbar.set_ticklabels(["Negative", "Neutral", "Positive"])
     cbar.ax.tick_params(labelsize=8)
     cbar.ax.yaxis.set_label_position("right")
-    # Adjust label rotation and alignment
     for label in cbar.ax.get_yticklabels():
         label.set_rotation(0)
         label.set_ha("left")
@@ -287,8 +338,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_path", type=str, default=None,
                         help="Direct path to the HDF5 dataset (overrides value in configs)")
     parser.add_argument("--out_path",     type=str, default=None,
-                        help="Output figure path (PDF or PNG). Default: <exp_dir>/local_inter.pdf")
-    parser.add_argument("--base_dir",     type=str, default="D:/CubiAI_tsetlin/perf",
+                        help="Output figure path (PDF or PNG). Default: path to save folder")
+    parser.add_argument("--base_dir",     type=str, default="set your/base/dir/here",
                         help="Base directory for experiments")
     parser.add_argument("--fold",         type=int, default=4,
                         help="Which fold to draw samples from (default: 4, the val fold)")
@@ -371,9 +422,13 @@ if __name__ == "__main__":
     print("\nComputing local clause maps...")
     transformed = transform_Xs(tm, X_bin_flat, img_shape=(img_h, img_w))
 
+    # Calculate certainty
+    print("Computing model certainty...")
+    certainty = get_clause_voting(tm, X_bin_flat)
+
     # Plot
     print("Plotting...")
-    fig = plot_local(X_sel, X_bin, Y_sel, Y_pred, transformed, n_bits)
+    fig = plot_local(X_sel, X_bin, Y_sel, Y_pred, transformed, n_bits, certainty)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
